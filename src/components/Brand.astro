@@ -1,0 +1,13 @@
+---
+import { useTranslations, type Lang } from '../i18n/ui';
+import { asset, homeUrl } from '../lib/pages';
+
+interface Props { lang: Lang }
+const { lang } = Astro.props;
+const t = useTranslations(lang);
+---
+<a class="ct-brand" href={homeUrl(lang)} aria-label={t('brand.aria')}>
+  <!-- Insignia: bandera del Zulia, que lleva el relámpago. Decorativa: el aria-label del enlace ya nombra la marca. -->
+  <img class="ct-flag" src={asset('img/zulia.svg')} width="30" height="20" alt="">
+  <span class="mono-brand">CATATUMBO<br><small>{t('brand.tagline')}</small></span>
+</a>

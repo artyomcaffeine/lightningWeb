@@ -1,0 +1,419 @@
+---
+/* "Tiempo y localización" (página con key 'today'), dos widgets:
+   - El pronóstico de esta noche y de las 6 siguientes en Congo Mirador. Lo pide el navegador a Open-Meteo al abrir la página
+     y guarda el último en localStorage (ct.forecast): sin conexión se ve ese, con su fecha.
+   - Un mapa (MapLibre GL, código abierto) con los lugares de la excursión y, si lo pides, tu posición precisa y la
+     distancia hasta cada lugar. Usa Liberty, el estilo por defecto de OpenFreeMap (OpenStreetMap). Sin conexión se ve
+     un contorno simplificado del lago y la costa que va dentro del sitio (src/assets/map/lago.json, de Natural Earth),
+     en los colores de Liberty. MapLibre pesa: se carga solo cuando el mapa entra en pantalla.
+     La ubicación solo se pide al pulsar el botón y no se guarda ni se envía. En la app la pide @capacitor/geolocation
+     (con los permisos nativos); en la web, el mismo plugin usa la del navegador.
+   Sin JavaScript solo se ve un aviso.
+
+     Today.astro ──▶ lib/forecast.ts ──▶ Open-Meteo, localStorage
+                 ──▶ lib/basemap.ts  ──▶ OpenFreeMap (o lago.json, sin conexión)
+                 ──▶ lib/location.ts ──▶ @capacitor/geolocation
+                 ──▶ lib/geo.ts          distancia, rumbo, círculo de precisión */
+import Icon from './Icon.astro';
+import { CONGO_MIRADOR } from '../lib/lake';
+import { useTranslations, type Lang, type UIKey } from '../i18n/ui';
+
+interface Props { lang: Lang }
+const { lang } = Astro.props;
+const t = useTranslations(lang);
+/* Los textos que usa el script del navegador. */
+const KEYS: UIKey[] = ['today.tonight', 'today.storm', 'today.rain', 'today.wind', 'today.sunset', 'today.high', 'today.mid', 'today.low',
+  'today.loading', 'today.updated', 'today.offline', 'today.none', 'today.locating', 'today.denied', 'today.unavailable', 'today.dirs',
+  'today.locate', 'today.recenter', 'today.accuracy', 'today.mapOffline', 'today.mapError', 'today.zoomIn', 'today.zoomOut', 'today.credits',
+  'today.gestureTouch', 'today.gestureWheel', 'today.gestureMac'];
+const text = Object.fromEntries(KEYS.map((k) => [k, t(k)]));
+/* Lugares de referencia (OpenStreetMap; por confirmar sobre el terreno, ver PLAN.md). */
+const PLACES: { name: string; role: UIKey; lat: number; lon: number }[] = [
+  { name: 'Puerto Concha', role: 'today.pier', lat: 9.0336, lon: -71.7502 },
+  { name: 'Congo Mirador', role: 'today.stilts', ...CONGO_MIRADOR },
+  { name: 'Ologá', role: 'today.stilts', lat: 9.4316, lon: -71.8350 },
+];
+---
+<section class="ct-section today" data-today data-lang={lang} data-t={JSON.stringify(text)}>
+  <!-- Primero la ubicación (el mapa); debajo, el tiempo (esta noche y las noches siguientes). -->
+  <article class="ct-panel today-map" data-map>
+    <div class="ct-panel-head"><span class="ct-eyebrow mono-eyebrow">{t('today.you')}</span><Icon name="compass" size={20} /></div>
+    <h2 class="ct-panel-title display-panel">{t('today.distance')}</h2>
+    <div class="ct-map"><div class="today-map-canvas" data-map-canvas><p class="copy-small">{t('today.mapNojs')}</p></div></div>
+    <div class="ct-map-controls">
+      <span role="status" data-map-status>{t('today.private')}</span>
+      <button class="ct-button mono-action" type="button" data-locate hidden>{t('today.locate')}</button>
+    </div>
+    <div class="ct-legend">
+      <p class="ct-index mono-eyebrow">{t('today.places')}</p>
+      <ol>
+        {PLACES.map((p, i) => (
+          <li data-lat={p.lat} data-lon={p.lon} data-name={p.name}>
+            <button type="button">
+              <span>{String(i + 1).padStart(2, '0')}</span>
+              <p><strong>{p.name}</strong> {t(p.role)}<small data-away></small></p>
+            </button>
+          </li>
+        ))}
+      </ol>
+    </div>
+  </article>
+  <div class="ct-index mono-eyebrow today-weather">{t('today.index')}</div>
+  <article class="ct-panel" aria-live="polite">
+    <div class="ct-panel-head"><span class="ct-eyebrow mono-eyebrow">{t('today.where')}</span><Icon name="bolt" size={20} /></div>
+    <h2 class="ct-panel-title display-panel" data-title>{t('today.tonight')}</h2>
+    <div data-tonight>
+      <div class="ct-skeleton"><i></i><i></i><i></i><span data-status>{t('today.nojs')}</span></div>
+    </div>
+    <p class="ct-panel-refresh">
+      <span data-updated></span>
+      <span>{t('today.source')}: <a href="https://open-meteo.com/" target="_blank" rel="noreferrer">Open-Meteo.com</a> · <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noreferrer">CC BY 4.0</a></span>
+    </p>
+  </article>
+  <h2 class="nights-title display-card">{t('today.nights')}</h2>
+  <ol class="nights" data-nights></ol>
+</section>
+
+<script>
+  import type { GeoJSONSource, Map as MapLibreMap, Marker } from 'maplibre-gl';
+  import 'maplibre-gl/dist/maplibre-gl.css';
+  /* El worker de MapLibre, como archivo aparte (ver lib/map-worker.ts): Vite no lo detecta solo, y en la app
+     (capacitor://) MapLibre no sabría dónde buscarlo. */
+  import workerUrl from '../lib/map-worker.ts?worker&url';
+  import { Basemap, loadBasemap } from '../lib/basemap';
+  import { Storm, fetchOutlook, isToday, savedOutlook, type Outlook } from '../lib/forecast';
+  import { circle, distanceKm, heading, type Point } from '../lib/geo';
+  import { CONGO_MIRADOR } from '../lib/lake';
+  import { LocateError, watchFix, type Fix } from '../lib/location';
+
+  type MapLibre = typeof import('maplibre-gl');
+  type Text = Record<string, string>;
+
+  /* Un lugar de la leyenda: su botón, dónde va la distancia, y su número en el mapa (01, 02…). */
+  interface Place extends Point { button: HTMLButtonElement; away: HTMLElement; name: string; number: string }
+
+  /* Si la tarjeta de esta noche lleva el aviso de "sin conexión" (se muestra el pronóstico guardado). */
+  const Notice = { None: 'none', Offline: 'offline' } as const;
+  type Notice = (typeof Notice)[keyof typeof Notice];
+
+  /* Ancho de la barra de esta noche, en %, según la probabilidad de tormenta. */
+  const METER_WIDTH: Record<Storm, number> = { [Storm.High]: 100, [Storm.Mid]: 66, [Storm.Low]: 33 };
+
+  const SKELETON = '<div class="ct-skeleton"><i></i><i></i><i></i><span></span></div>';
+
+  /* Encuadre del mapa: al abrirlo (todos los lugares), al pulsar un lugar y al encontrarte. */
+  const PADDING = 60;
+  const START_MAX_ZOOM = 9.5;
+  const PLACE_ZOOM = 12;
+  const ME_ZOOM = 13;
+
+  /* Más lejos que esto de Congo Mirador, el mapa va a tu posición en vez de encuadrarte con los lugares. */
+  const FAR_KM = 400;
+
+  /* MapLibre empieza a descargarse cuando al mapa le falta esto para entrar en pantalla. */
+  const PRELOAD_MARGIN = '300px';
+
+  /* Fuente y capa del círculo de precisión de tu posición. */
+  const ACCURACY = 'accuracy';
+
+  const PIN = '<svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true"><circle class="ct-map-dot-ring" cx="11" cy="11" r="10"/><circle class="ct-map-dot" cx="11" cy="11" r="5"/></svg><span class="map-pin-label"></span>';
+  const USER_DOT = '<svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true"><circle class="ct-map-user-halo" cx="17" cy="17" r="16"/><circle class="ct-map-user" cx="17" cy="17" r="7"/></svg>';
+
+  /* El marcador se ancla por la izquierda: se corre medio ancho (22 / 2) para que el punto caiga sobre el lugar. */
+  const PIN_OFFSET: [number, number] = [-11, 0];
+
+  function element(className: string, html: string) {
+    const el = document.createElement('div');
+    el.className = className;
+    el.innerHTML = html;
+
+    return el;
+  }
+
+  /* El rectángulo que contiene todos los puntos. */
+  function bounds(maplibre: MapLibre, points: Point[]) {
+    const [first] = points;
+    const box = new maplibre.LngLatBounds([first.lon, first.lat], [first.lon, first.lat]);
+
+    return points.reduce((b, p) => b.extend([p.lon, p.lat]), box);
+  }
+
+  /* El pronóstico: al momento se ve el guardado (si hay) y luego el recién descargado. Sin conexión se queda el
+     guardado, con un aviso. */
+  function initForecast(root: HTMLElement, t: Text, lang: string) {
+    const tonight = root.querySelector<HTMLElement>('[data-tonight]')!;
+    const list = root.querySelector<HTMLElement>('[data-nights]')!;
+    const updated = root.querySelector<HTMLElement>('[data-updated]')!;
+    const title = root.querySelector<HTMLElement>('[data-title]')!;
+
+    const day = new Intl.DateTimeFormat(lang, { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
+    const stamp = new Intl.DateTimeFormat(lang, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    const percent = new Intl.NumberFormat(lang, { style: 'percent' });
+    const speed = new Intl.NumberFormat(lang, { style: 'unit', unit: 'kilometer-per-hour', maximumFractionDigits: 0 });
+    const dayOf = (date: string) => day.format(new Date(`${date}T00:00Z`));
+
+    /* Mientras no hay pronóstico: el esqueleto de la tarjeta, con un mensaje. */
+    function status(message: string) {
+      tonight.innerHTML = SKELETON;
+      tonight.querySelector('span')!.textContent = message;
+    }
+
+    /* Esta noche, en grande; las siguientes, en la lista. */
+    function show(outlook: Outlook, notice: Notice) {
+      const [first, ...rest] = outlook.nights;
+      if (!first) {
+        status(t['today.none']);
+        return;
+      }
+
+      title.textContent = isToday(first.date) ? t['today.tonight'] : dayOf(first.date);
+
+      tonight.innerHTML = `
+        ${notice === Notice.Offline ? `<p class="ct-note ct-note-warning today-offline">${t['today.offline']}</p>` : ''}
+        <div class="ct-reading storm-${first.storm}">
+          <span class="display-figure">${t[`today.${first.storm}`]}</span>
+          <span class="ct-reading-label copy-small">${t['today.storm']}</span>
+        </div>
+        <div class="ct-meter" aria-hidden="true"><span style="width: ${METER_WIDTH[first.storm]}%"></span></div>
+        <dl class="ct-reading-grid mono-data">
+          <div><dt>${t['today.rain']}</dt><dd>${percent.format(first.rain / 100)}</dd></div>
+          <div><dt>${t['today.wind']}</dt><dd>${speed.format(first.wind)}</dd></div>
+          <div><dt>${t['today.sunset']}</dt><dd>${first.sunset}</dd></div>
+        </dl>`;
+
+      list.innerHTML = rest.map((n) => `
+        <li>
+          <span class="night-date display-list">${dayOf(n.date)}</span>
+          <span class="storm-${n.storm}"><small>${t['today.storm']}</small>${t[`today.${n.storm}`]}</span>
+          <span><small>${t['today.rain']}</small>${percent.format(n.rain / 100)}</span>
+          <span><small>${t['today.wind']}</small>${speed.format(n.wind)}</span>
+          <span><small>${t['today.sunset']}</small>${n.sunset}</span>
+        </li>`).join('');
+
+      updated.textContent = `${t['today.updated']}: ${stamp.format(outlook.at)}`;
+    }
+
+    const saved = savedOutlook();
+    if (saved) {
+      show(saved, Notice.None);
+    } else {
+      status(t['today.loading']);
+    }
+
+    fetchOutlook()
+      .then((fresh) => show(fresh, Notice.None))
+      .catch(() => (saved ? show(saved, Notice.Offline) : status(t['today.none'])));
+  }
+
+  /* El mapa con los lugares y, si lo pides, tu posición y la distancia a cada lugar. */
+  function initMap(root: HTMLElement, t: Text, lang: string) {
+    const panel = root.querySelector<HTMLElement>('[data-map]')!;
+    const canvas = panel.querySelector<HTMLElement>('[data-map-canvas]')!;
+    const button = panel.querySelector<HTMLButtonElement>('[data-locate]')!;
+    const note = panel.querySelector<HTMLElement>('[data-map-status]')!;
+    const privacy = note.textContent ?? '';
+
+    const places: Place[] = [...panel.querySelectorAll<HTMLElement>('[data-lat]')].map((li, i) => ({
+      button: li.querySelector('button')!,
+      away: li.querySelector<HTMLElement>('[data-away]')!,
+      name: li.dataset.name!,
+      number: String(i + 1).padStart(2, '0'),
+      lon: Number(li.dataset.lon),
+      lat: Number(li.dataset.lat),
+    }));
+
+    const dirs = t['today.dirs'].split(' ');
+    const km = new Intl.NumberFormat(lang, { style: 'unit', unit: 'kilometer', maximumFractionDigits: 1 });
+    const meters = new Intl.NumberFormat(lang, { style: 'unit', unit: 'meter', maximumFractionDigits: 0 });
+    let basemap: Basemap = Basemap.Online;
+
+    /* El aviso bajo el mapa, con "mapa sin conexión" detrás cuando el estilo es el de respaldo. */
+    function say(message: string) {
+      const offline = basemap === Basemap.Offline ? t['today.mapOffline'] : '';
+      note.textContent = [message, offline].filter(Boolean).join(' ');
+    }
+
+    /* Hasta dónde está un lugar desde tu posición. Ej.: 850 m, o 12,4 km · NO. */
+    function away(here: Point, place: Place) {
+      const distance = distanceKm(here, place);
+      if (distance < 1) {
+        return meters.format(Math.round(distance * 1000));
+      }
+
+      return `${km.format(distance)} · ${heading(here, place, dirs)}`;
+    }
+
+    /* En el teléfono la leyenda va debajo del mapa: si el mapa no se ve entero, lo trae a la pantalla. */
+    function reveal() {
+      const box = canvas.getBoundingClientRect();
+      if (box.top >= 0 && box.bottom <= innerHeight) {
+        return;
+      }
+
+      const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+      canvas.scrollIntoView({ block: 'center', behavior: still ? 'auto' : 'smooth' });
+    }
+
+    /* El círculo de precisión de tu posición, encima del estilo (Liberty o el de respaldo), en el color del punto. */
+    function addAccuracy(map: MapLibreMap) {
+      map.on('load', () => {
+        map.addSource(ACCURACY, { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+        const red = getComputedStyle(document.documentElement).getPropertyValue('--map-user').trim();
+        map.addLayer({ id: ACCURACY, type: 'fill', source: ACCURACY, paint: { 'fill-color': red, 'fill-opacity': 0.12, 'fill-outline-color': red } });
+      });
+    }
+
+    /* La leyenda: cada lugar centra el mapa en él. */
+    function bindLegend(map: MapLibreMap) {
+      for (const p of places) {
+        p.button.addEventListener('click', () => {
+          places.forEach((q) => q.button.removeAttribute('aria-current'));
+          p.button.setAttribute('aria-current', 'true');
+          map.flyTo({ center: [p.lon, p.lat], zoom: PLACE_ZOOM });
+          reveal();
+        });
+      }
+    }
+
+    /* Un marcador por lugar. Liberty ya escribe los nombres de los pueblos: el marcador lleva solo el número.
+       Sin conexión, también el nombre. */
+    function addPins(maplibre: MapLibre, map: MapLibreMap) {
+      for (const p of places) {
+        const pin = element('map-pin', PIN);
+        pin.querySelector('.map-pin-label')!.textContent = basemap === Basemap.Offline ? `${p.number} ${p.name}` : p.number;
+        new maplibre.Marker({ element: pin, anchor: 'left', offset: PIN_OFFSET }).setLngLat([p.lon, p.lat]).addTo(map);
+      }
+    }
+
+    /* Tu posición: se pide al pulsar el botón y se sigue mientras la página está abierta. */
+    function bindLocate(maplibre: MapLibre, map: MapLibreMap) {
+      let me: Marker | null = null;
+      let here: Point | null = null;
+      let stop: (() => void) | null = null;
+
+      /* La primera vez: si estás lejos del lago, el mapa va a ti; si no, te encuadra con los lugares. */
+      function frame(point: Point) {
+        if (distanceKm(point, CONGO_MIRADOR) > FAR_KM) {
+          map.flyTo({ center: [point.lon, point.lat], zoom: PLACE_ZOOM });
+          return;
+        }
+
+        map.fitBounds(bounds(maplibre, [point, ...places]), { padding: PADDING, maxZoom: ME_ZOOM });
+      }
+
+      /* Cada lectura: mueve tu punto y su círculo, y actualiza la precisión y las distancias. */
+      function update(fix: Fix) {
+        const first = !here;
+        here = { lon: fix.lon, lat: fix.lat };
+
+        me ??= new maplibre.Marker({ element: element('map-user', USER_DOT) }).setLngLat([fix.lon, fix.lat]).addTo(map);
+        me.setLngLat([fix.lon, fix.lat]);
+        (map.getSource(ACCURACY) as GeoJSONSource | undefined)?.setData({ type: 'FeatureCollection', features: [circle(here, fix.accuracy)] });
+        say(`${t['today.accuracy']}: ± ${meters.format(Math.round(fix.accuracy))}`);
+
+        for (const p of places) {
+          p.away.textContent = away(here, p);
+        }
+
+        if (!first) {
+          return;
+        }
+
+        button.textContent = t['today.recenter'];
+        frame(here);
+      }
+
+      function fail(error: LocateError) {
+        say(error === LocateError.Denied ? t['today.denied'] : t['today.unavailable']);
+        button.disabled = false;
+      }
+
+      button.hidden = false;
+      button.addEventListener('click', async () => {
+        if (here) {
+          map.flyTo({ center: [here.lon, here.lat], zoom: Math.max(map.getZoom(), ME_ZOOM) });
+          return;
+        }
+
+        button.disabled = true;
+        say(t['today.locating']);
+        stop = await watchFix((fix) => {
+          button.disabled = false;
+          update(fix);
+        }, fail);
+      });
+
+      addEventListener('pagehide', () => stop?.());
+    }
+
+    async function start() {
+      let maplibre: MapLibre;
+      let map: MapLibreMap;
+
+      try {
+        maplibre = await import('maplibre-gl');
+        maplibre.setWorkerUrl(workerUrl);
+        const { style, source } = await loadBasemap();
+        basemap = source;
+        canvas.textContent = '';
+        map = new maplibre.Map({
+          container: canvas,
+          style,
+          bounds: bounds(maplibre, places),
+          fitBoundsOptions: { padding: PADDING, maxZoom: START_MAX_ZOOM },
+          attributionControl: { compact: true },
+          cooperativeGestures: true,
+          dragRotate: false,
+          pitchWithRotate: false,
+          locale: {
+            'NavigationControl.ZoomIn': t['today.zoomIn'], 'NavigationControl.ZoomOut': t['today.zoomOut'],
+            'AttributionControl.ToggleAttribution': t['today.credits'],
+            'CooperativeGesturesHandler.MobileHelpText': t['today.gestureTouch'],
+            'CooperativeGesturesHandler.WindowsHelpText': t['today.gestureWheel'],
+            'CooperativeGesturesHandler.MacHelpText': t['today.gestureMac'],
+          },
+        });
+      } catch {
+        canvas.textContent = t['today.mapError'];
+        return;
+      }
+
+      map.addControl(new maplibre.NavigationControl({ showCompass: false }), 'top-right');
+      map.touchZoomRotate.disableRotation();
+
+      if (basemap === Basemap.Offline) {
+        say(privacy);
+      }
+
+      addAccuracy(map);
+      bindLegend(map);
+      addPins(maplibre, map);
+      bindLocate(maplibre, map);
+    }
+
+    /* MapLibre pesa: solo se descarga cuando el mapa está a punto de verse. */
+    new IntersectionObserver((entries, observer) => {
+      if (!entries.some((e) => e.isIntersecting)) {
+        return;
+      }
+
+      observer.disconnect();
+      start();
+    }, { rootMargin: PRELOAD_MARGIN }).observe(panel);
+  }
+
+  function init() {
+    const root = document.querySelector<HTMLElement>('[data-today]');
+    if (!root) {
+      return;
+    }
+
+    const t: Text = JSON.parse(root.dataset.t ?? '{}');
+    const lang = root.dataset.lang ?? 'es';
+
+    initForecast(root, t, lang);
+    initMap(root, t, lang);
+  }
+
+  init();
+</script>

@@ -1,0 +1,169 @@
+---
+/* Marca (con las banderas), menú, selector de idioma (desplegable) y (en teléfonos) el botón del menú. */
+import Brand from './Brand.astro';
+import Globe from './Globe.astro';
+import { LANG_NAMES, useTranslations, type Lang } from '../i18n/ui';
+import { pagesIn, pageUrl, type PageKey } from '../lib/pages';
+
+interface Props { lang: Lang; current?: PageKey; alternates: { lang: Lang; href: string }[] }
+const { lang, current, alternates } = Astro.props;
+const t = useTranslations(lang);
+const nav = await pagesIn(lang);
+---
+<header class="ct-topbar">
+  <Brand lang={lang} />
+  <nav class="ct-nav" id="nav" aria-label={t('nav.aria')}>
+    {nav.map((p) => (
+      <a href={pageUrl(p)} class="mono-nav" aria-current={p.data.key === current ? 'page' : undefined}>{p.data.title}</a>
+    ))}
+  </nav>
+  <div class="ct-nav-actions">
+    <!-- Selector de idioma: un desplegable nativo (<details>), así se abre también sin JavaScript. Lista todos los
+         idiomas de LANGS, sean cuantos sean; cada uno lleva a la misma página en ese idioma. -->
+    <details class="lang-menu" data-lang-menu>
+      <summary class="ct-language" aria-label={`${t('nav.lang')}: ${LANG_NAMES[lang]}`}>
+        <Globe size={18} />
+      </summary>
+      <ul>
+        {alternates.map((v) => (
+          <li>
+            <a class="mono-nav" href={v.href} hreflang={v.lang} lang={v.lang} aria-current={v.lang === lang ? 'true' : undefined}>
+              <span>{LANG_NAMES[v.lang]}</span> <small>{v.lang.toUpperCase()}</small>
+            </a>
+          </li>
+        ))}
+      </ul>
+    </details>
+    <button class="ct-menu-button" id="menu-toggle" type="button" aria-label={t('menu.open')} aria-expanded="false" aria-controls="nav">
+      <svg class="ct-icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="i-menu" d="M4 5h16M4 12h16M4 19h16"/><path class="i-x" d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+</header>
+
+<script>
+  import { rememberLang } from '../lib/lang';
+
+  /* Los dos desplegables (menú en teléfonos e idioma) cuelgan del mismo sitio: solo uno abierto a la vez.
+     Se despliegan hacia abajo al abrirse y se recogen hacia la barra al cerrarse (ver site.css).
+
+       abrir:   clase/atributo de abierto ──▶ animación menu-drop
+       cerrar:  clase is-closing ──▶ animación menu-rise ──▶ (animationend) se quita lo de abierto */
+  const CLOSING = 'is-closing';
+
+  const button = document.getElementById('menu-toggle')!;
+  const nav = document.getElementById('nav')!;
+  const menu = document.querySelector<HTMLDetailsElement>('[data-lang-menu]')!;
+  const list = menu.querySelector('ul')!;
+
+  /* Cierres en curso: lo que falta por hacer cuando termine la animación de cada desplegable. */
+  const pending = new Map<HTMLElement, () => void>();
+
+  /* Recoge un desplegable y, al terminar la animación, lo cierra de verdad (done). Sin animación si el visitante
+     pidió menos movimiento. */
+  function fold(el: HTMLElement, done: () => void) {
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      done();
+      return;
+    }
+
+    const end = () => {
+      unfold(el);
+      done();
+    };
+
+    el.classList.add(CLOSING);
+    el.addEventListener('animationend', end, { once: true });
+    pending.set(el, end);
+  }
+
+  /* Cancela un cierre en curso: se vuelve a abrir antes de que termine de recogerse. */
+  function unfold(el: HTMLElement) {
+    const end = pending.get(el);
+    if (!end) {
+      return;
+    }
+
+    el.removeEventListener('animationend', end);
+    el.classList.remove(CLOSING);
+    pending.delete(el);
+  }
+
+  const navOpen = () => nav.classList.contains('is-open') && !nav.classList.contains(CLOSING);
+  const langOpen = () => menu.open && !list.classList.contains(CLOSING);
+
+  /* Menú en teléfonos: el botón abre y cierra la navegación. Al abrirla, cierra el idioma. */
+  function openNav() {
+    unfold(nav);
+    nav.classList.add('is-open');
+    button.classList.add('is-open');
+    button.setAttribute('aria-expanded', 'true');
+    closeLang();
+  }
+
+  function closeNav() {
+    if (!navOpen()) {
+      return;
+    }
+
+    button.classList.remove('is-open');
+    button.setAttribute('aria-expanded', 'false');
+    fold(nav, () => nav.classList.remove('is-open'));
+  }
+
+  /* Selector de idioma (un <details>, así funciona sin JavaScript). Con JavaScript el script lo abre y lo cierra,
+     para poder animar el cierre. Al abrirlo, cierra la navegación. */
+  function openLang() {
+    unfold(list);
+    menu.open = true;
+    closeNav();
+  }
+
+  function closeLang() {
+    if (!langOpen()) {
+      return;
+    }
+
+    fold(list, () => { menu.open = false; });
+  }
+
+  button.addEventListener('click', () => {
+    if (navOpen()) {
+      closeNav();
+      return;
+    }
+
+    openNav();
+  });
+
+  menu.querySelector('summary')!.addEventListener('click', (e) => {
+    e.preventDefault();
+
+    if (langOpen()) {
+      closeLang();
+      return;
+    }
+
+    openLang();
+  });
+
+  /* El idioma se cierra al pulsar fuera o con Escape, y recuerda el idioma elegido para la próxima visita
+     a la raíz del sitio. */
+  document.addEventListener('click', (e) => {
+    if (!menu.contains(e.target as Node)) {
+      closeLang();
+    }
+  });
+
+  menu.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !langOpen()) {
+      return;
+    }
+
+    closeLang();
+    menu.querySelector('summary')!.focus();
+  });
+
+  menu.querySelectorAll<HTMLAnchorElement>('a[hreflang]').forEach((a) => {
+    a.addEventListener('click', () => rememberLang(a.hreflang));
+  });
+</script>
